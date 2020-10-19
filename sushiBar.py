@@ -1,7 +1,7 @@
 import redis
 
 #connect to redis
-client = redis.Redis(host="localhost", port="6379", db=0, charset="utf-8", decode_responses=True)
+client = redis.Redis(host="localhost", port="6380", db=0, charset="utf-8", decode_responses=True)
 print("Connection status:", client.ping())
 
 #print list of sushi
@@ -27,19 +27,30 @@ def registerUsers(userID, username):
 def payment(username, orderID):
     print("THE START OF THE TRANSACTION\n")
     userID = client.get(username)
-    print(userID)
     while True:
         try:
             p = client.pipeline()
             keys = client.hgetall(username + orderID)
             p.watch(userID)
-            print("watching")
             for key in keys:
                 p.watch(key)
+            price = int(p.hget(orderID, "price"))
+            if int(client.hget(userID, 'ricepoints')) < price:
+                print("Not enough ricepoints to pay")
+                client.unwatch()
+                break
+
             p.multi()
-            p.hincrby(userID, 'ricepoints', -int(client.hget(orderID, "price")))
-            for key in keys: 
-                p.incrby(key, -int(client.hget(username + orderID, key)))
+            #if here aswell? 
+            p.hincrby(userID, 'ricepoints', -int(price))
+
+            for key in keys:
+                if int(client.hget(username + orderID, key)) <= int(client.get(key)):
+                    p.incrby(key, -int(client.hget(username + orderID, key)))
+                else:
+                    print(key, "sushi OUT OF STOCK\n")
+                    p.reset()
+                    break
             p.execute()
             break
         except redis.WatchError:
@@ -47,11 +58,11 @@ def payment(username, orderID):
         finally:
             p.reset()
     print("THE END OF THE TRANSACTION\n")
+    getInfoUser(userID)
 
 
 # additional list of cartID and usernames
 def shoppingCarts(cartID, username):
-    #p = client.pipeline()
     client.lpush("carts", username)
     client.set(username, cartID)
 
@@ -59,51 +70,61 @@ def shoppingCarts(cartID, username):
 def createOrder(username):
     client.incr('orderNum')
     orderID = "order" + str(client.get('orderNum')) 
-    print(orderID)
+    print(orderID, username)
     client.hset(orderID, 'username', username)
     client.hset(orderID, 'shoppingCartID', username + orderID)
-    client.hset(orderID, 'price', 0)    
+    client.hset(orderID, 'price', 0)  
+    
     return orderID
 
 # add sushi to the shopping cart
-def addSushiToTheShoppingCart(username, wantedSushi, howMany, orderID): 
-    #p = client.pipeline()
-    #p.watch(wantedSushi)
-    client.hset(username + orderID, wantedSushi, howMany)
+def addSushiToTheShoppingCart(username, wantedSushi, howMany, orderID):
+    client.hincrby(username + orderID, wantedSushi, howMany)
     client.hincrby(orderID, 'price', howMany) # increase total price of order
 
 # delete order
 def deleteOrder(orderID, username):
     print("Your order will be deleted soon")
-    client.hdel(orderID)
-    client.hdel(username + orderID)
+    client.delete(orderID)
+    client.delete(username + orderID)
     print("Order deleted succesfully")
 
 def selectSushi(username, orderID):
-    wantedSushi = input("Type the name of sushi you want to order\n")
+    orderedSushi = {}
+    while True: # While ordering
+        printSushiSet()
+        wantedSushi = input("Type the name of sushi you want to order\n")
 
-    #check if sushi exists
-    if check(wantedSushi) == 0:
-        print("Wrong sushi, start ordering again")
-        selectSushi(username, orderID)
-    
-    #selecting sushi
-    elif check(wantedSushi) == 1:
-        print("How many of ", wantedSushi, " sushi you want to order? (in stock: ", client.get(wantedSushi), " )")
-        howMany = input()
-        #check if sushi is in stock and start adding (not updating)
-        if howMany <= client.get(wantedSushi):
-            addSushiToTheShoppingCart(username, wantedSushi, howMany, orderID)   
-            ans = input("Want to add more sushis? 1 - YES, 0 - NO") 
-            if ans.isdigit() and int(ans) == 1:
-                selectSushi(username, orderID)
-            else:
-                ans = input("Pay? 1 - YES, 0 - DELETE ORDER")
+            #check if sushi exists
+        if check(wantedSushi) == 0:
+            print("Wrong sushi, start ordering again")
+            continue
+
+        elif check(wantedSushi) == 1:
+            if wantedSushi not in orderedSushi:
+                orderedSushi[wantedSushi] = int(client.get(wantedSushi))
+            print("How many of ", wantedSushi, " sushi you want to order? (in stock: ", orderedSushi[wantedSushi], " )")
+            howMany = int(input())
+
+            if howMany <= int(client.get(wantedSushi)):
+                addSushiToTheShoppingCart(username, wantedSushi, howMany, orderID)
+                orderedSushi[wantedSushi] -= howMany   
+                ans = input("Want to add more sushis? 1 - YES, 0 - NO\n") 
                 if ans.isdigit() and int(ans) == 1:
-                    payment(username, orderID)
-                elif ans.isdigit() and int(ans) == 0:
-                    deleteOrder(orderID, username)
-                    startup()
+                    continue
+                else:
+                    ans = input("Pay? 1 - YES, 0 - DELETE ORDER\n")
+                    if ans.isdigit() and int(ans) == 1:
+                        payment(username, orderID)
+                        break
+                    elif ans.isdigit() and int(ans) == 0:
+                        deleteOrder(orderID, username)
+                        startup()
+                        break
+            else:
+                print("Selected sushi is not in stock. Sorry!")
+                continue
+
 
 def shopping(username):
     operation = input("Do you want to order some sushi? 0 - NO, 1- YES\n")
@@ -133,13 +154,13 @@ def registerNewClient(username, password):
     client.hset(userID, 'ricepoints', 15)
     print("REGISTRATION SUCCESSFULL")
     getInfoUser(userID)
+
     return username
     
 def logIn(username, password):
     if check(username) == 0:
         print("ERROR - user does not exist, redirecting to RREGISTER")  
-        registerNewClient(username, password)     
-        return   
+        return registerNewClient(username, password)     
     userID = client.get(username)
     print(client.hget(userID, 'password'))
     if password == client.hget(userID, 'password'):
@@ -149,8 +170,9 @@ def logIn(username, password):
         logIn(username, input("Incorrect password, try again: ")) 
 
 def startup():
-    operation = input("Press 1 to see list of sushi, 2 to order sushi, 3 to see information about your balace and shoppint cart, 4 to input new sushi, 0 TO EXIT\n ")
-    
+    operation = input("Press 1 to see list of sushi, 2 to order sushi, 3 to see information about your balance and shopping cart, 4 to input new sushi, 0 TO EXIT\n ")
+    user = ""
+
     # list all sushi types
     if operation.isdigit() and int(operation) == 1:
         printSushiSet()
@@ -178,6 +200,9 @@ def startup():
         username = input("Enter username: ")
         userID = client.get(username)
         getInfoUser(userID)
+    elif operation.isdigit() and int(operation) == 4:
+        print("Input new sushi")
+        newSushiInput(input("Sushi name: "), input("Sushi count: "))
     else:
         exit()
 
@@ -196,9 +221,10 @@ registerNewClient(input("Type your name: "), input("Type your surename: ")) """
 
 
 """ print("Input new sushi")
-newSushiInput(input("Sushi name: "), input("Sushi count: "))
-"""  
-""" print(client.lrange('sushi', 0, -1))  """
+newSushiInput(input("Sushi name: "), input("Sushi count: ")) """
+
+  
+#print(client.lrange('sushi', 0, -1)) 
 
 # get a value
 """ value = client.get('test-key')
